@@ -108,19 +108,170 @@ if (pid == 0) {
 ```
 思考: 关于先后顺序以及阻塞问题, 如果管道为空read()会阻塞. 理解到这里就够了. ~~什么管道满了write也会阻塞,这很符合逻辑,但感觉没必要记这个.~~
 
+## 关于多线程知识
+### 基本概念
+关于进程和线程在linux和windows上面很大区别.linux的最小执行单元是进程,而windows中真正的最小执行单元是线程. 总结:现代C++程序,C++11多线程功能是主流,C++11的多线程就是windows模式的,进程为一个仓库,线程才是程序执行的最小单元.
+**主线程与子线程是平级的**,**只是**主线程结束完毕后会给所有子线程发信号强制结束子线程,然后进程结束.
+子线程的创建用thread类. 然后必须用`join`或者`detach`; 要等就用join,不等就用detach.
+用`std::this_thread::get_id()`可以查看线程id, this_thread是一个命名空间, 类似进程的pid. 不同进程可以有相同的线程id.
+```cpp
+int main() {
+    `std::thread myThread([](){
+        std::cout << "hello world" << std::endl;
+    })`; // 里面方一个可调用对象就好
+    myThread.join(); // 主线程挂起, 等待子线程结束.
+    return 0;
+}
+```
+```cpp
+int main() {
+    std::thread myThread([](){
+        for (int i = 0; i < 1e9; i ++>) {
+
+        }
+    })
+    myThread.detach(); // 子线程交给C++运行库了, 主线程结束后也不会强制结束子线程以避免bug
+}
+```
+### 传参机制
+有很多细节问题, 用detach时, 可能主线程已经over了, 而子线程用到了主线程里面的东西...
+略, 很多细节.以后再看看初心老哥的视频.
+
 ## 线程锁有哪些?锁的缺点(竞争等待这些), mutex
+### 前置概念
+**线程锁的相关概念. 首先是多线程, 现代程序都是用的多线程程序, cpu这些都是多核的嘛. 然后多个线程多数据进行读写是会有冲突, 所以需要数据保护. 保护方式就是用锁.**
+多线程的执行顺序是乱的没有规律, 有规律的是协程; 所谓的没规律, 例如主线程,子线程,都对一个全局变量g_num++;
+讲锁之前, 提一点, g_num++时, 是把g_num从内存拷贝到寄存器, ++后再拷回内存. 如果此时两个进程都对g_num++, 那就出问题. 应该++两次但只会++一次. 还有其他读写问题. 所以引入了数据保护, 锁这些概念.
+```cpp
+unsigned g_num = 0;
+std::mutex myMutex;
+void test() {
+    std::lock_guard<std::mutex> lg(myMutex); // 类似智能指针, 自动unlock, 避免忘记unlock类似忘记delete.
+    // myMutex.lock();
+    for (unsigned i = 0; i < 10000000; ++i){
+        ++g_num;
+    }
+    // myMutex.unlock();
+}
+int main() {
+    std::thread myThread(test);
+    std::lock_guard<std::mutex> lg(myMutex); // 类似智能指针, 自动unlock, 避免忘记unlock类似忘记delete.
+    // myMutex.lock();
+    for (unsigned i = 0; i < 10000000; ++i) {
+        ++g_num;
+    }
+    // myMutex.unlock();
+    myThread.join(); // 这个程序也可以写成开两个子线程来竞争锁,来做++操作, 主线程仅仅用于两个join. 小问题.
+    std::cout << g_num << std::endl; // 输出12453501
+    return 0;
+}
+```
+### 正式回答这个问题
+只要有写的情况就需要进行数据保护, 数据保护就两种方法: 互斥锁和原子操作.
+- 互斥锁: 两个线程看谁先抢到锁,线程是共享资源的. 没抢到的就阻塞.
+    - 缺点: 手动lock后容易忘记unlock, 类似智能指针搞了一个lock_guard. **以后都用lock_guard, 不用lock unlock**
+- 原子操作: 使用频率远远低于互斥锁.
+    - 用法: `std::atomic<unsigned> g_num = 0;`代替`unsigned g_num = 0;` g_num作为原子对象时, 就不需要数据保护了, 就不用锁操作了.
+    - 优点: 简单,适用于简单计数. 对单个数据.
+    - 缺点: 但是当保护的数据很多时就极其复杂.
+
+### 死锁
+解决方法: 两个锁顺序一致就好.
+死锁必须是定义**两个锁**哦!!! **两个mutex**, 考虑`lock_guard<std::mutex>`的情况, **两个线程**用**两个锁**的顺序不一样;
+```cpp
+unsigned g_num = 0;
+std::mutex myMutex1;
+std::mutex myMutex2;
+void test() {
+    std::lock_guard<std::mutex> lg(myMutex); // 类似智能指针, 自动unlock, 避免忘记unlock类似忘记delete.
+    // myMutex.lock();
+    for (unsigned i = 0; i < 10000000; ++i){
+        std::lock_guard<std::mutex> lg1(myMutex);
+        /*
+        ...
+        */
+        std::lock_guard<std::mutex> lg2(myMutex);
+        ++ g_num;
+    }
+    // myMutex.unlock();
+}
+int main() {
+    std::thread myThread(test);
+    for (unsigned i = 0; i < 10000000; ++i) {
+        std::lock_guard<std::mutex> lg2(myMutex);
+        /*
+        ...
+        */
+        std::lock_guard<std::mutex> lg1(myMutex);
+        ++ g_num;
+    }
+    myThread.join();
+    std::cout << g_num << std::endl;
+    return 0;
+    // 更多细节略, 例如std::adop_lock, std::lock这些略...
+}
+```
+
 
 ## lambda表达式/常规函数调用的区别, (functioncal很少很少)
+- 是否捕获外部变量: &引用捕获, =值捕获, &=可以混用
+- 是否支持重载
+- 递归的支持?局部与全局: 写算法题的时候经常用到dfs, 一般dfs都是写在外面当全局函数, 有的用lambda表达式写在mian函数内做递归调用.
+
+### 可调用对象
+这涉及到可调用对象的概念, 
+- 函数: 自然可以调用()运算符,最典型的可调用对象.
+- 仿函数: 具有operator()函数的对象
+- lambda表达式: 最简单是`[]{}`, 为什么省略(),答:当没有参数时()可以省略. 完整的lambda`[capture](parameters) -> return_type { body }`
 
 ## 设计模式(单例/工厂/观察者). 工厂很复杂,单例饿汉懒汉
+- 单例模式
+    - 懒汉式(推荐): 先不创建实例, 第一次调用geetInstance才创建. 构造函数是private, 拷贝构造和operator=() = delete;
+    单例模式确保一个类只有一个实例，并提供一个全局访问点。代码上基本都是两个private(一个构造函数,一个创建实例), 一个public getInstance();
+    - 饿汉式: 类加载时就创建实例. 简单但可能造成资源浪费.
+    - 还有的为了线程安全等问题, 会增加枷锁操作,原子操作.
+
+- 工厂模式
+    没刻意去背诵, 讲一下人形机器人训练的两套代码中, 有的用到了工厂模式.
+    老实回答: 没有刻意去背诵,目前只有我再阅读两套python代码, 人形机器人的训练的开源代码的两套代码中, 对一些代码看不懂时, 调试的时候顺序有点乱, 这时才注意到设计模式的重要性. 用到了注册表模式和工厂模式,观察者模式. 我只是通过询问AI知道有这些, 但没进一步花时间专门去理解设计模式.
 
 ## 介绍一些std::move,右值语义,完美转发
 视频得再看一下;
+- 左值右值: =左边只能是左值. 左值:拥有地址属性. 右值:不是左值就是右值.
+- std::move: 把左值变成右值引用; move让左值失去了地址属性.
+- 右值引用: 只能绑定右值的引用. `int&& rref = 2;`或`int&& rref = x + 2;`但是不能`int&& rref = x;`
+- 万能引用: 编译期被当做左值引言或右值引用处理. 作用: 当参数为左值时当做左值引言, 传参为右值当做右值引用.
+    - 引用折叠, &引用符号太多就折叠, 4变2, 3变1.
+        - 万能引用+左值->左值引用: T&& & -> T&
+        - 万能引用+右值->右值引用: T&& && -> T&&
+```cpp
+using boost::typeindex::type_id_with_cvr;
+template<typename T>
+void test(T&& elem) { // 万能引言这样写, const T&&表示右值引言了.
+    std::cout << "elem type is : " << type_id_with_cvr<decltype(elem)>().pretty_name() << std::endl; // delctype是用于推理表达式的类型.
+    std::cout << "T type is : " << type_id_with_cvr<T>().pretty_name() << std::endl;
+}
+int main() {
+    int i = 10;
+    test(10);   //  elem type is : int &&          T type is : int
+    test(i);    //  elem type is : int &           T type is : int &
+    test(std::move(i)); // 同 test(10);
+    return 0;
+}
+```
+- 完美转发:  完美转发就是一个参数是左值, 传递给另一个函数时也保持左值, 右值同理. 配合万能引用使用的. 
+    - `int&& rrefI = 10`**右值引用, 但是rrefI本身是一个左值啊**.
+    - func1,func2都是万能引用, func1中调用一个`func2(std::forward<T>(param))`;
+
 
 ## 继承相关(不直接考), 耦合与解耦, 写一个模块如何解耦,耦合问题. 模块化编程
+工厂模式.
 
 ## STL的底层, vector, set, 底层数据结构和内存管理机制. 增容扩张与erase机制.
 视频得再看一下;
+顺序容器: vector/deque等
+关联容器: set/map等
+无序式容器: unordered_map...
 
 ## malloc new free delete, 数组用的少
 new是C++分配内存的主要方式. new返回的是一个指针, 而且我感觉new有比较大的设计缺陷, 就是一个对象和数组对象的返回值是一样的. delete的时候还要做区分.
